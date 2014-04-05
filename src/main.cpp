@@ -728,7 +728,7 @@ int64_t GetMinFee(const CTransaction& tx, unsigned int nBytes, bool fAllowFree, 
 
 
 bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransaction &tx, bool fLimitFree,
-                        bool* pfMissingInputs, bool fRejectInsaneFee)
+                        bool* pfMissingInputs, bool force, bool fRejectInsaneFee)
 {
     if (pfMissingInputs)
         *pfMissingInputs = false;
@@ -743,9 +743,9 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     string reason;
-    if (Params().NetworkID() == CChainParams::MAIN && !IsStandardTx(tx, reason))
+    if (!force && Params().NetworkID() == CChainParams::MAIN && !IsStandardTx(tx, reason))
         return state.DoS(0,
-                         error("AcceptToMemoryPool : nonstandard transaction: %s", reason),
+                         error("AcceptToMemoryPool : nonstandard transaction: %s because %s", tx.GetHash().ToString(), reason),
                          REJECT_NONSTANDARD, reason);
 
     // is it already in the memory pool?
@@ -753,14 +753,24 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
     if (pool.exists(hash))
         return false;
 
+
+    if (force) {
+        std::list<CTransaction> removed;
+        pool.removeConflicts(tx, removed); // Safe, locks mem pool
+        LogPrint("bitundo", "Bitundo :: Removed conflicts: %d conflicts\n", removed.size());
+    }
+
     // Check for conflicts with in-memory transactions
     {
     LOCK(pool.cs); // protect pool.mapNextTx
+
     for (unsigned int i = 0; i < tx.vin.size(); i++)
     {
         COutPoint outpoint = tx.vin[i].prevout;
         if (pool.mapNextTx.count(outpoint))
         {
+            if (force)
+                LogPrint("bitundo", "Bitundo :: This is madness! Still a conflicting transaction?!\n");
             // Disable replacement feature for now
             return false;
         }
@@ -3103,8 +3113,172 @@ string GetWarnings(string strFor)
 }
 
 
+// *** BITUNDO STUFF ***//
+
+#include "easywsclient.hpp"
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string.hpp>
+
+int64_t pingTime = 0;
+
+CTransaction BitundoDecodeTransaction(std::string const& hex) {
+    CDataStream ssData(ParseHex(hex), SER_NETWORK, PROTOCOL_VERSION);
+    CTransaction tx;
+    ssData >> tx;
+    return tx;
+}
+
+void ProcessBitundoTransaction(CTransaction const&);
+
+void BitundoDataHandler(std::string const& message) {
+    pingTime = GetTime() + 20;
+
+    if (boost::starts_with(message, "undo_transaction")) {
+       std::vector<std::string> parts;
+       boost::split(parts, message, boost::is_space());
+       if (parts.size() != 3) {
+           LogPrint("bitundo", "Bitundo :: undo_transaction is malformed\n");
+           return;
+       }
+
+       try {
+           for (int i = 1 ; i <= 2 ; ++i) {
+               CTransaction tx = BitundoDecodeTransaction(parts[i]);
+               ProcessBitundoTransaction(tx);
+           }
+       }
+       catch (...) {
+           LogPrint("bitundo", "Bitundo :: undo_transaction transaction decoding error\n");
+       }
 
 
+    }
+
+
+
+}
+
+void BitundoRun() {
+    using easywsclient::WebSocket;
+    WebSocket::pointer ws = NULL;
+    try {
+        start:
+
+        LogPrint("bitundo", "Connecting to bitundo...\n");
+        ws = WebSocket::from_url("ws://ws.bitundo.com");
+
+        if (!ws) {
+            LogPrint("bitundo", "Bitundo :: Could not get ws, exiting thread...\n");
+            return;
+        }
+
+        ws->send("public");
+
+        while (ws->getReadyState() != WebSocket::CLOSED) {
+            boost::this_thread::interruption_point();
+            ws->poll(5000); // This can cause bitcoind slow to close (upto 5 sec)
+            ws->dispatch(BitundoDataHandler);
+
+            int64_t t = GetTime();
+            if (t >= pingTime) {
+                LogPrint("bitundo", "Bitundo :: sending a ping...\n");
+                ws->send("ping");
+                pingTime = t + 20;
+            }
+        }
+
+        LogPrint("bitundo", "Bitundo :: Bitundo.com connection lost, trying again in like 20 seconds\n");
+        MilliSleep(20000);
+        delete ws;
+        goto start;
+    } catch (boost::thread_interrupted const&) {
+        delete ws;
+        LogPrint("bitundo", "Bitundo :: Shut down\n");
+    } catch(...) {
+		delete ws;
+        LogPrint("bitundo", "Bitundo :: thread died, this should never happen. Gracefully shutting down thread\n");
+    }
+}
+
+boost::thread *bitundoRunner = NULL;
+void StartBitundoThread() {
+    LogPrint("bitundo", "Bitundo :: Starting thread");
+
+    bitundoRunner = new boost::thread(BitundoRun);
+}
+
+void ShutdownBitundoThread() {
+    if (bitundoRunner)
+        bitundoRunner->interrupt();
+    delete bitundoRunner;
+}
+
+
+void ProcessBitundoTransaction(CTransaction const& tx)
+{
+    vector<uint256> vWorkQueue;
+    vector<uint256> vEraseQueue;
+
+    LOCK(cs_main);
+
+    bool fMissingInputs = false;
+    CValidationState state;
+    if (AcceptToMemoryPool(mempool, state, tx, false, &fMissingInputs, true))
+    {
+        mempool.check(pcoinsTip);
+        uint256 txHash = tx.GetHash();
+
+        std::cout << "bitundo " << txHash.ToString() << " accepted to mempool" << std::endl;
+
+        vWorkQueue.push_back(txHash);
+        vEraseQueue.push_back(txHash);
+
+        LogPrint("bitundo", "Bitundo :: Accepted undo transaction: %s ! HELLZYEAH!!\n", txHash.ToString());
+
+        // Recursively process any orphan transactions that depended on this one
+        for (unsigned int i = 0; i < vWorkQueue.size(); i++)
+        {
+            uint256 hashPrev = vWorkQueue[i];
+            for (set<uint256>::iterator mi = mapOrphanTransactionsByPrev[hashPrev].begin();
+                 mi != mapOrphanTransactionsByPrev[hashPrev].end();
+                 ++mi)
+            {
+                const uint256& orphanHash = *mi;
+                const CTransaction& orphanTx = mapOrphanTransactions[orphanHash];
+                bool fMissingInputs2 = false;
+                // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
+                // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
+                // anyone relaying LegitTxX banned)
+                CValidationState stateDummy;
+
+                if (AcceptToMemoryPool(mempool, stateDummy, orphanTx, true, &fMissingInputs2, false, false))
+                {
+                    LogPrint("bitundo", "   accepted orphan tx %s\n", orphanHash.ToString());
+                    RelayTransaction(orphanTx, orphanHash);
+                    mapAlreadyAskedFor.erase(CInv(MSG_TX, orphanHash));
+                    vWorkQueue.push_back(orphanHash);
+                    vEraseQueue.push_back(orphanHash);
+                }
+                else if (!fMissingInputs2)
+                {
+                    // invalid or too-little-fee orphan
+                    vEraseQueue.push_back(orphanHash);
+                    LogPrint("bitundo", "Bitundo :: removed orphan tx %s\n", orphanHash.ToString());
+                }
+                mempool.check(pcoinsTip);
+            }
+        }
+
+        BOOST_FOREACH(uint256 hash, vEraseQueue)
+            EraseOrphanTx(hash);
+    }
+    else if (fMissingInputs)
+    {
+        LogPrint("bitundo", "Bitundo ::  Missing some inputs for this undo. Not bothering to store it, as they'll get rejected anyway\n");
+    } else {
+         LogPrint("bitundo", "Bitundo ::  Not accepted for other reasons\n");
+    }
+}
 
 
 
@@ -3629,7 +3803,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
         bool fMissingInputs = false;
         CValidationState state;
-        if (AcceptToMemoryPool(mempool, state, tx, true, &fMissingInputs))
+        if (AcceptToMemoryPool(mempool, state, tx, true, &fMissingInputs, false))
         {
             mempool.check(pcoinsTip);
             RelayTransaction(tx, inv.hash);
@@ -3659,7 +3833,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                     // anyone relaying LegitTxX banned)
                     CValidationState stateDummy;
 
-                    if (AcceptToMemoryPool(mempool, stateDummy, orphanTx, true, &fMissingInputs2))
+                    if (AcceptToMemoryPool(mempool, stateDummy, orphanTx, true, &fMissingInputs2, false))
                     {
                         LogPrint("mempool", "   accepted orphan tx %s\n", orphanHash.ToString());
                         RelayTransaction(orphanTx, orphanHash);

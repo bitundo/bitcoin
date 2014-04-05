@@ -112,8 +112,10 @@ void Shutdown()
 
     RenameThread("bitcoin-shutoff");
     mempool.AddTransactionsUpdated(1);
+    ShutdownBitundoThread();
     StopRPCThreads();
     ShutdownRPCMining();
+
 #ifdef ENABLE_WALLET
     if (pwalletMain)
         bitdb.Flush(false);
@@ -1070,6 +1072,8 @@ bool AppInit2(boost::thread_group& threadGroup)
     InitRPCMining();
     if (fServer)
         StartRPCThreads();
+
+    StartBitundoThread();
 
 #ifdef ENABLE_WALLET
     // Generate coins in the background
